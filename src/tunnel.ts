@@ -38,6 +38,14 @@ interface ConnectionState {
 	connectedAt?: Date;
 }
 
+interface QueuedRequest {
+	id: string;
+	proxyRequest: ProxyRequest;
+	resolve: (response: ProxyResponse) => void;
+	reject: (error: Error) => void;
+	timeout: NodeJS.Timeout;
+}
+
 export class TunnelBroker {
 	private hostConnection: WebSocket | null = null;
 	private readonly RESPONSE_TIMEOUT = 60000; // 60 seconds
@@ -49,6 +57,8 @@ export class TunnelBroker {
 			timeout: NodeJS.Timeout;
 		}
 	>();
+	private requestQueue: QueuedRequest[] = [];
+	private isProcessingQueue = false;
 	private requestIdCounter = 0;
 
 	constructor() {
@@ -412,7 +422,7 @@ export class TunnelBroker {
 		};
 	}
 
-	// Private method to send request to host and wait for response
+	// Private method to send request to host and wait for response (with queue)
 	private async sendRequestAndWaitForResponse(proxyRequest: ProxyRequest): Promise<ProxyResponse> {
 		if (!this.hostConnection) {
 			throw new Error("No host connection available");
@@ -427,44 +437,110 @@ export class TunnelBroker {
 					path: proxyRequest.path,
 					timeout: this.RESPONSE_TIMEOUT,
 				});
-				this.pendingRequests.delete(requestId);
+				this.removeFromQueue(requestId);
 				reject(new Error("Request timeout"));
 			}, this.RESPONSE_TIMEOUT);
 
-			// Store the pending request
-			this.pendingRequests.set(requestId, {
+			// Add request to queue
+			const queuedRequest: QueuedRequest = {
+				id: requestId,
+				proxyRequest,
 				resolve,
 				reject,
 				timeout: timeoutId,
+			};
+
+			this.requestQueue.push(queuedRequest);
+			this.logConnectionEvent("Request added to queue", {
+				method: proxyRequest.method,
+				path: proxyRequest.path,
+				queueLength: this.requestQueue.length,
 			});
 
+			// Start processing queue if not already processing
+			this.processQueue();
+		});
+	}
+
+	// Private method to process the request queue sequentially
+	private async processQueue(): Promise<void> {
+		if (this.isProcessingQueue || this.requestQueue.length === 0) {
+			return;
+		}
+
+		this.isProcessingQueue = true;
+
+		while (this.requestQueue.length > 0) {
+			const queuedRequest = this.requestQueue.shift();
+			if (!queuedRequest) break;
+
+			try {
+				await this.sendSingleRequest(queuedRequest);
+			} catch (error) {
+				// Error handling is done in sendSingleRequest
+			}
+		}
+
+		this.isProcessingQueue = false;
+	}
+
+	// Private method to send a single request from the queue
+	private async sendSingleRequest(queuedRequest: QueuedRequest): Promise<void> {
+		return new Promise<void>((resolve) => {
 			// Check connection state before sending
 			if (!this.hostConnection || this.hostConnection.readyState !== WebSocket.OPEN) {
-				clearTimeout(timeoutId);
-				this.pendingRequests.delete(requestId);
-				reject(new Error("Host connection not available"));
+				clearTimeout(queuedRequest.timeout);
+				queuedRequest.reject(new Error("Host connection not available"));
+				resolve();
 				return;
 			}
 
+			// Store the pending request
+			this.pendingRequests.set(queuedRequest.id, {
+				resolve: (response: ProxyResponse) => {
+					clearTimeout(queuedRequest.timeout);
+					queuedRequest.resolve(response);
+					resolve();
+				},
+				reject: (error: Error) => {
+					clearTimeout(queuedRequest.timeout);
+					queuedRequest.reject(error);
+					resolve();
+				},
+				timeout: queuedRequest.timeout,
+			});
+
 			// Send the request
 			try {
-				this.hostConnection.send(JSON.stringify(proxyRequest));
+				this.hostConnection.send(JSON.stringify(queuedRequest.proxyRequest));
 				this.logConnectionEvent("Request sent to host", {
-					method: proxyRequest.method,
-					path: proxyRequest.path,
-					bodySize: proxyRequest.body.length,
+					method: queuedRequest.proxyRequest.method,
+					path: queuedRequest.proxyRequest.path,
+					bodySize: queuedRequest.proxyRequest.body.length,
+					queueLength: this.requestQueue.length,
 				});
 			} catch (error) {
-				clearTimeout(timeoutId);
-				this.pendingRequests.delete(requestId);
+				clearTimeout(queuedRequest.timeout);
+				this.pendingRequests.delete(queuedRequest.id);
 				const errorMessage = error instanceof Error ? error.message : "Unknown error";
 				this.logConnectionEvent("Failed to send request to host", {
 					error: errorMessage,
 					connectionState: this.hostConnection?.readyState,
 				});
-				reject(new Error(`Failed to send request to host: ${errorMessage}`));
+				queuedRequest.reject(new Error(`Failed to send request to host: ${errorMessage}`));
+				resolve();
 			}
 		});
+	}
+
+	// Private method to remove a request from the queue
+	private removeFromQueue(requestId: string): void {
+		const index = this.requestQueue.findIndex(req => req.id === requestId);
+		if (index !== -1) {
+			const removed = this.requestQueue.splice(index, 1)[0];
+			clearTimeout(removed.timeout);
+		}
+		this.pendingRequests.delete(requestId);
 	}
 
 	// Private method to deserialize response and create Response object
@@ -666,18 +742,26 @@ export class TunnelBroker {
 
 	// Public method to cleanup resources
 	public cleanup(): void {
-		this.logConnectionEvent("Cleaning up tunnel broker resources");
+		this.logConnectionEvent("Cleaning up tunnel broker");
 
 		// Clear all pending requests
 		for (const [requestId, pendingRequest] of this.pendingRequests) {
 			clearTimeout(pendingRequest.timeout);
-			pendingRequest.reject(new Error("Server shutting down"));
+			pendingRequest.reject(new Error("Tunnel broker is shutting down"));
 		}
 		this.pendingRequests.clear();
 
-		// Close host connection
+		// Clear request queue
+		for (const queuedRequest of this.requestQueue) {
+			clearTimeout(queuedRequest.timeout);
+			queuedRequest.reject(new Error("Tunnel broker is shutting down"));
+		}
+		this.requestQueue = [];
+		this.isProcessingQueue = false;
+
+		// Close host connection if exists
 		if (this.hostConnection) {
-			this.hostConnection.close(1001, "Server shutting down");
+			this.hostConnection.close(1000, "Tunnel broker shutting down");
 			this.hostConnection = null;
 		}
 	}
