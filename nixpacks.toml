@@ -1,0 +1,18 @@
+[variables]
+PORT = "8000"
+
+[phases.setup]
+nixPkgs = ["nodejs-18_x", "nodePackages.pnpm"]
+
+[phases.build]
+cmds = [
+  "pnpm install --frozen-lockfile",
+  "pnpm run build"
+]
+
+[phases.start]
+cmd = "pnpm start"
+
+# Expose both SSH and HTTP ports to host
+[start]
+ports = ["2222:2222", "8000:8000"]
