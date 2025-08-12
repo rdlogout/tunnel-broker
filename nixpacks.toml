@@ -1,0 +1,26 @@
+[variables]
+PORT = "8000"
+
+[phases.build]
+cmds = [
+  "npm ci",
+  "npm run build"
+]
+
+[phases.start]
+cmd = "npm start"
+
+[phases.setup]
+nixPkgs = ["nodejs-18_x", "npm"]
+
+# Expose both SSH and HTTP ports
+[phases.deploy]
+ports = ["2222", "8000"]
+
+# Health check configuration
+[healthcheck]
+path = "/health"
+port = 8000
+interval = 30
+timeout = 10
+retries = 3

@@ -1,188 +1,147 @@
-import { serve } from "@hono/node-server";
-import { Hono } from "hono";
-import { TunnelBroker } from "./tunnel.js";
-import { logger } from "hono/logger";
-import { createNodeWebSocket } from "@hono/node-ws";
-import { UpgradeWebSocket } from "hono/ws";
-import { cache } from "hono/cache";
-import { etag } from "hono/etag";
+import { createServer, request as httpRequest } from "http";
+import { createServer as createTcpServer, createConnection } from "net";
+import ssh2 from "ssh2";
+import { generateKeyPairSync } from "crypto";
+import type { Connection, AcceptConnection, RejectConnection, TcpipRequestInfo, AuthContext } from "ssh2";
+const { Server } = ssh2;
 
-const app = new Hono();
-const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
-
-// Custom logger that handles WebSocket upgrades properly
-app.use(async (c, next) => {
-	const start = Date.now();
-	await next();
-	const end = Date.now();
-	
-	// Skip logging for WebSocket upgrade responses to prevent status code errors
-	if (c.res.status === 101) {
-		return;
-	}
-	
-	console.log(`${c.req.method} ${c.req.url} ${c.res.status} ${end - start}ms`);
+// Generate a temporary host key for the SSH server in the correct format
+const { privateKey } = generateKeyPairSync("rsa", {
+	modulusLength: 2048,
+	publicKeyEncoding: { type: "spki", format: "pem" },
+	privateKeyEncoding: { type: "pkcs1", format: "pem" },
 });
 
-// Add caching middleware for static assets
-app.use('/static/*', cache({
-	cacheName: 'tunnel-broker-static',
-	cacheControl: 'max-age=31536000', // 1 year for static assets
-}));
-
-// Add ETag support for better caching
-app.use('*', etag());
-
-// Create a single global tunnel broker instance
-const tunnelBroker = new TunnelBroker();
-
-// Health check endpoint
-app.get("/_health", (c) => {
-	console.log("[Server] Health check requested");
-	return c.text("OK");
+const sshServer = new Server({
+	hostKeys: [privateKey],
 });
+const httpServer = createServer();
 
-// Static file serving with caching for common web assets
-app.get('/favicon.ico', cache({ cacheName: 'favicon', cacheControl: 'max-age=86400' }), (c) => {
-	return c.notFound();
-});
+// SSH Server Configuration
+sshServer
+	.on("connection", (client: Connection) => {
+		console.log("SSH client connected");
 
-// Handle common static file extensions with appropriate caching
-const staticFileExtensions = ['.js', '.css', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.woff', '.woff2', '.ttf', '.eot'];
-app.use('*', async (c, next) => {
-	const url = new URL(c.req.url);
-	const pathname = url.pathname;
-	
-	// Check if this is a static file request
-	const isStaticFile = staticFileExtensions.some(ext => pathname.endsWith(ext));
-	
-	if (isStaticFile) {
-		// Add caching headers for static files
-		c.header('Cache-Control', 'public, max-age=31536000, immutable'); // 1 year
-		c.header('Vary', 'Accept-Encoding');
-		
-		// Set appropriate content type
-		if (pathname.endsWith('.js')) {
-			c.header('Content-Type', 'application/javascript');
-		} else if (pathname.endsWith('.css')) {
-			c.header('Content-Type', 'text/css');
-		} else if (pathname.endsWith('.svg')) {
-			c.header('Content-Type', 'image/svg+xml');
-		} else if (pathname.endsWith('.png')) {
-			c.header('Content-Type', 'image/png');
-		} else if (pathname.endsWith('.jpg') || pathname.endsWith('.jpeg')) {
-			c.header('Content-Type', 'image/jpeg');
-		} else if (pathname.endsWith('.gif')) {
-			c.header('Content-Type', 'image/gif');
-		} else if (pathname.endsWith('.webp')) {
-			c.header('Content-Type', 'image/webp');
-		} else if (pathname.endsWith('.woff')) {
-			c.header('Content-Type', 'font/woff');
-		} else if (pathname.endsWith('.woff2')) {
-			c.header('Content-Type', 'font/woff2');
-		} else if (pathname.endsWith('.ttf')) {
-			c.header('Content-Type', 'font/ttf');
-		} else if (pathname.endsWith('.eot')) {
-			c.header('Content-Type', 'application/vnd.ms-fontobject');
-		}
-	}
-	
-	await next();
-});
-
-// WebSocket endpoint for host connections
-app.get("/__connect", upgradeWebSocket((c) => {
-	return {
-		onOpen: (evt, ws) => {
-			console.log("[Server] Host WebSocket connection established");
-			if (ws.raw) {
-				tunnelBroker.handleHostWebSocketUpgrade(ws.raw);
+		client.on("authentication", (ctx: AuthContext) => {
+			if (ctx.method === "password" && ctx.username === "proxyuser" && ctx.password === "secret") {
+				ctx.accept();
+			} else {
+				ctx.reject();
 			}
-		},
-		onMessage: (evt, ws) => {
-			// Messages are handled by the tunnel broker
-		},
-		onClose: (evt, ws) => {
-			console.log("[Server] Host WebSocket connection closed");
-		},
-		onError: (evt, ws) => {
-			console.error("[Server] Host WebSocket error:", evt);
-		}
-	};
-}));
-
-// Route all other requests to the tunnel broker
-app.all("*", async (c) => {
-	try {
-		const request = c.req.raw;
-		const response = await tunnelBroker.handleRequest(request);
-		return response;
-	} catch (error) {
-		console.error("[Server] Error handling request:", {
-			url: c.req.url,
-			method: c.req.method,
-			error: error instanceof Error ? error.message : "Unknown error",
-			stack: error instanceof Error ? error.stack : undefined,
 		});
-		
-		// Return appropriate error response based on error type
-		if (error instanceof Error) {
-			if (error.message.includes("timeout")) {
-				return c.text("Gateway Timeout", 504);
-			} else if (error.message.includes("connection") || error.message.includes("host")) {
-				return c.text("Bad Gateway", 502);
-			} else if (error.message.includes("not available") || error.message.includes("not connected")) {
-				return c.text("Service Unavailable", 503);
-			}
-		}
-		
-		return c.text("Internal Server Error", 500);
-	}
-});
 
-const port = parseInt(process.env.PORT || "3000");
+		client.on("ready", () => {
+			console.log("SSH client authenticated");
 
-console.log(`[Server] Starting tunnel broker on port ${port}`);
-console.log(`[Server] Health check available at http://localhost:${port}/_health`);
+			client.on("request", (accept: AcceptConnection<any> | undefined, reject: RejectConnection | undefined, name: string, info: any) => {
+				if (name === "tcpip-forward") {
+					console.log(`Setting up port forwarding for ${info.bindAddr}:${info.bindPort}`);
 
-const server = serve(
-	{
-		fetch: app.fetch,
-		port,
-	},
-	(info) => {
-		console.log(`[Server] Tunnel broker is running on http://localhost:${info.port}`);
-	}
-);
+					// Create a TCP server to listen on the requested port
+					const tcpServer = createTcpServer((socket) => {
+						console.log(`Incoming connection to tunnel port ${info.bindPort}`);
 
-// Inject WebSocket support
-injectWebSocket(server);
+						// For reverse tunnel, directly connect to the local service
+						const targetSocket = createConnection(3000, "127.0.0.1", () => {
+							console.log("Connected to target service on port 3000");
+							// Pipe data between the tunnel socket and target socket
+							socket.pipe(targetSocket);
+							targetSocket.pipe(socket);
+						});
 
-// Global error handlers to prevent crashes
-process.on('uncaughtException', (error) => {
-	console.error('[Server] Uncaught Exception:', {
-		error: error.message,
-		stack: error.stack,
-		timestamp: new Date().toISOString(),
+						targetSocket.on("error", (err: any) => {
+							console.error("Target socket error:", err);
+							socket.end();
+						});
+
+						socket.on("error", (err: any) => {
+							console.error("Tunnel socket error:", err);
+							targetSocket.end();
+						});
+
+						socket.on("close", () => {
+							targetSocket.end();
+						});
+
+						targetSocket.on("close", () => {
+							socket.end();
+						});
+					});
+
+					tcpServer.listen(info.bindPort, info.bindAddr, () => {
+						console.log(`TCP server listening on ${info.bindAddr}:${info.bindPort}`);
+						accept?.();
+					});
+
+					tcpServer.on("error", (err) => {
+						console.error("TCP server error:", err);
+						reject?.();
+					});
+				} else if (name === "cancel-tcpip-forward") {
+					console.log(`Canceling port forwarding for ${info.bindAddr}:${info.bindPort}`);
+					accept?.();
+				} else {
+					reject?.();
+				}
+			});
+
+			client.on("tcpip", (accept: AcceptConnection<any>, reject: RejectConnection, info: TcpipRequestInfo) => {
+				const stream = accept();
+				console.log(`Forwarding connection from ${info.srcIP}:${info.srcPort} to ${info.destIP}:${info.destPort}`);
+
+				// Proxy HTTP requests to tunnel
+				httpServer.emit("proxy-request", stream);
+			});
+		});
+	})
+	.listen(2222, () => {
+		console.log("SSH server listening on port 2222");
 	});
-	// Don't exit on uncaught exceptions in production
-	// Just log them and continue
+
+// Store active tunnel connections
+let tunnelStream: any = null;
+
+// HTTP Server Configuration
+httpServer.on("request", (req, res) => {
+	console.log(`Proxying request: ${req.method} ${req.url}`);
+
+	// Try to connect through the SSH tunnel to the forwarded port
+	const proxyReq = httpRequest(
+		{
+			host: "127.0.0.1",
+			port: 3001, // This should connect through the SSH tunnel to host:3000
+			method: req.method,
+			path: req.url,
+			headers: req.headers,
+		},
+		(proxyRes) => {
+			console.log(`Received response: ${proxyRes.statusCode}`);
+			res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+			proxyRes.pipe(res);
+		}
+	);
+
+	proxyReq.on("error", (err) => {
+		console.error("Proxy request error:", err);
+		res.writeHead(502, { "Content-Type": "text/plain" });
+		res.end("Bad Gateway - SSH tunnel not available");
+	});
+
+	req.pipe(proxyReq);
 });
 
-process.on('unhandledRejection', (reason, promise) => {
-	console.error('[Server] Unhandled Rejection at:', promise, 'reason:', reason);
-	// Don't exit on unhandled rejections
+httpServer.on("proxy-request", (stream) => {
+	// Store the tunnel stream for HTTP proxying
+	tunnelStream = stream;
+	console.log("Tunnel stream established");
+
+	// Handle stream close
+	stream.on("close", () => {
+		tunnelStream = null;
+		console.log("Tunnel stream closed");
+	});
 });
 
-// Graceful shutdown handling
-process.on("SIGINT", () => {
-	console.log("[Server] Received SIGINT, shutting down gracefully...");
-	tunnelBroker.cleanup();
-	process.exit(0);
-});
-
-process.on("SIGTERM", () => {
-	console.log("[Server] Received SIGTERM, shutting down gracefully...");
-	tunnelBroker.cleanup();
-	process.exit(0);
+httpServer.listen(8000, () => {
+	console.log("HTTP server listening on port 8000");
 });
