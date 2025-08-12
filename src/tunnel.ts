@@ -40,7 +40,7 @@ interface ConnectionState {
 
 export class TunnelBroker {
 	private hostConnection: WebSocket | null = null;
-	private readonly RESPONSE_TIMEOUT = 30000; // 30 seconds
+	private readonly RESPONSE_TIMEOUT = 60000; // 60 seconds
 	private pendingRequests = new Map<
 		string,
 		{
