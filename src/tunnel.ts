@@ -210,14 +210,12 @@ export class TunnelBroker {
 			return this.createErrorResponse(503, "No host connected");
 		}
 
-		// For Node.js WebSocket proxy, we need to return upgrade response
-		// The actual WebSocket handling will be done in the upgrade event
-		return new Response(null, {
-			status: 101,
-			headers: {
-				Upgrade: "websocket",
-				Connection: "Upgrade",
-			},
+		// For WebSocket requests, we should not return a Response object with status 101
+		// Instead, return a 426 Upgrade Required response to indicate WebSocket upgrade is needed
+		// The actual WebSocket handling will be done through the upgrade mechanism
+		return this.createErrorResponse(426, "Upgrade Required", {
+			"Upgrade": "websocket",
+			"Connection": "Upgrade",
 		});
 	}
 
@@ -366,7 +364,8 @@ export class TunnelBroker {
 				readyState: webSocket.readyState,
 				timestamp: new Date().toISOString(),
 			});
-			this.cleanupHostConnection();
+			// Don't immediately cleanup on error, let close event handle it
+			// This prevents double cleanup and potential race conditions
 		});
 
 		// Handle incoming messages
@@ -379,13 +378,37 @@ export class TunnelBroker {
 			} catch (error) {
 				this.logConnectionEvent("Error parsing host message", {
 					error: error instanceof Error ? error.message : "Unknown error",
+					message: data.toString(),
 				});
+				// Don't crash the connection for parsing errors
 			}
+		});
+
+		// Add ping/pong to keep connection alive
+		webSocket.on("ping", () => {
+			webSocket.pong();
+		});
+
+		// Handle unexpected response
+		webSocket.on("unexpected-response", (request, response) => {
+			this.logConnectionEvent("Unexpected WebSocket response", {
+				statusCode: response.statusCode,
+				headers: response.headers,
+			});
 		});
 	}
 
 	// Private method to handle proxy responses
 	private handleProxyResponse(response: ProxyResponse): void {
+		// Validate the response before processing
+		if (!this.validateProxyResponse(response)) {
+			this.logConnectionEvent("Invalid proxy response received from host", {
+				response: response,
+			});
+			// Don't process invalid responses
+			return;
+		}
+
 		// For now, we'll use a simple approach without request IDs
 		// In a production system, you'd want to implement proper request/response correlation
 		const pendingRequest = Array.from(this.pendingRequests.values())[0];
