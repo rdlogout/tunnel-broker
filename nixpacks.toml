@@ -10,9 +10,5 @@ cmds = [
   "pnpm run build"
 ]
 
-[phases.start]
-cmd = "pnpm start"
-
-# Expose both SSH and HTTP ports to host
 [start]
-ports = ["2222:2222", "8000:8000"]
+cmd = "pnpm start"
