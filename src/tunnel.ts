@@ -364,8 +364,7 @@ export class TunnelBroker {
 				readyState: webSocket.readyState,
 				timestamp: new Date().toISOString(),
 			});
-			// Don't immediately cleanup on error, let close event handle it
-			// This prevents double cleanup and potential race conditions
+			this.cleanupHostConnection();
 		});
 
 		// Handle incoming messages
@@ -378,23 +377,8 @@ export class TunnelBroker {
 			} catch (error) {
 				this.logConnectionEvent("Error parsing host message", {
 					error: error instanceof Error ? error.message : "Unknown error",
-					message: data.toString(),
 				});
-				// Don't crash the connection for parsing errors
 			}
-		});
-
-		// Add ping/pong to keep connection alive
-		webSocket.on("ping", () => {
-			webSocket.pong();
-		});
-
-		// Handle unexpected response
-		webSocket.on("unexpected-response", (request, response) => {
-			this.logConnectionEvent("Unexpected WebSocket response", {
-				statusCode: response.statusCode,
-				headers: response.headers,
-			});
 		});
 	}
 
