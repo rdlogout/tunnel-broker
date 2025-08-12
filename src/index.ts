@@ -1,147 +1,153 @@
-import { createServer, request as httpRequest } from "http";
-import { createServer as createTcpServer, createConnection } from "net";
-import ssh2 from "ssh2";
-import { generateKeyPairSync } from "crypto";
-import type { Connection, AcceptConnection, RejectConnection, TcpipRequestInfo, AuthContext } from "ssh2";
-const { Server } = ssh2;
+// src/relay-server.ts
+import express, { Request, Response } from "express";
+import http from "http";
+import WebSocket, { WebSocketServer } from "ws";
 
-// Generate a temporary host key for the SSH server in the correct format
-const { privateKey } = generateKeyPairSync("rsa", {
-	modulusLength: 2048,
-	publicKeyEncoding: { type: "spki", format: "pem" },
-	privateKeyEncoding: { type: "pkcs1", format: "pem" },
-});
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server });
 
-const sshServer = new Server({
-	hostKeys: [privateKey],
-});
-const httpServer = createServer();
+// Store connected clients (assuming one for simplicity, adapt for multiple)
+let connectedClient: WebSocket | null = null;
 
-// SSH Server Configuration
-sshServer
-	.on("connection", (client: Connection) => {
-		console.log("SSH client connected");
+// Store pending requests (mapping Request ID to original req/res)
+interface PendingRequest {
+	req: Request;
+	res: Response;
+}
+const pendingRequests = new Map<string, PendingRequest>();
 
-		client.on("authentication", (ctx: AuthContext) => {
-			if (ctx.method === "password" && ctx.username === "proxyuser" && ctx.password === "secret") {
-				ctx.accept();
-			} else {
-				ctx.reject();
-			}
-		});
+// Utility to generate unique IDs
+function generateUniqueId(): string {
+	return Date.now().toString(36) + Math.random().toString(36).substring(2);
+}
 
-		client.on("ready", () => {
-			console.log("SSH client authenticated");
+// --- WebSocket Handling ---
 
-			client.on("request", (accept: AcceptConnection<any> | undefined, reject: RejectConnection | undefined, name: string, info: any) => {
-				if (name === "tcpip-forward") {
-					console.log(`Setting up port forwarding for ${info.bindAddr}:${info.bindPort}`);
+wss.on("connection", (ws: WebSocket) => {
+	console.log("PC A client connected");
+	connectedClient = ws; // Store the latest client connection
 
-					// Create a TCP server to listen on the requested port
-					const tcpServer = createTcpServer((socket) => {
-						console.log(`Incoming connection to tunnel port ${info.bindPort}`);
+	ws.on("message", (message: WebSocket.RawData) => {
+		try {
+			const msgString = message.toString();
+			const msg = JSON.parse(msgString);
+			console.log("Received message from PC A:", msg);
 
-						// For reverse tunnel, directly connect to the local service
-						const targetSocket = createConnection(3000, "127.0.0.1", () => {
-							console.log("Connected to target service on port 3000");
-							// Pipe data between the tunnel socket and target socket
-							socket.pipe(targetSocket);
-							targetSocket.pipe(socket);
-						});
-
-						targetSocket.on("error", (err: any) => {
-							console.error("Target socket error:", err);
-							socket.end();
-						});
-
-						socket.on("error", (err: any) => {
-							console.error("Tunnel socket error:", err);
-							targetSocket.end();
-						});
-
-						socket.on("close", () => {
-							targetSocket.end();
-						});
-
-						targetSocket.on("close", () => {
-							socket.end();
-						});
-					});
-
-					tcpServer.listen(info.bindPort, info.bindAddr, () => {
-						console.log(`TCP server listening on ${info.bindAddr}:${info.bindPort}`);
-						accept?.();
-					});
-
-					tcpServer.on("error", (err) => {
-						console.error("TCP server error:", err);
-						reject?.();
-					});
-				} else if (name === "cancel-tcpip-forward") {
-					console.log(`Canceling port forwarding for ${info.bindAddr}:${info.bindPort}`);
-					accept?.();
+			if (msg.type === "http_response_init") {
+				const { requestId, statusCode, headers } = msg;
+				const pending = pendingRequests.get(requestId);
+				if (pending) {
+					console.log(`Initializing response for request ${requestId}`);
+					pending.res.writeHead(statusCode, headers);
+					// Don't end the response yet, data is coming via HTTP POST
 				} else {
-					reject?.();
+					console.warn(`Received init for unknown request ID: ${requestId}`);
 				}
-			});
-
-			client.on("tcpip", (accept: AcceptConnection<any>, reject: RejectConnection, info: TcpipRequestInfo) => {
-				const stream = accept();
-				console.log(`Forwarding connection from ${info.srcIP}:${info.srcPort} to ${info.destIP}:${info.destPort}`);
-
-				// Proxy HTTP requests to tunnel
-				httpServer.emit("proxy-request", stream);
-			});
-		});
-	})
-	.listen(2222, () => {
-		console.log("SSH server listening on port 2222");
-	});
-
-// Store active tunnel connections
-let tunnelStream: any = null;
-
-// HTTP Server Configuration
-httpServer.on("request", (req, res) => {
-	console.log(`Proxying request: ${req.method} ${req.url}`);
-
-	// Try to connect through the SSH tunnel to the forwarded port
-	const proxyReq = httpRequest(
-		{
-			host: "127.0.0.1",
-			port: 3000, // This should connect through the SSH tunnel to host:3000
-			method: req.method,
-			path: req.url,
-			headers: req.headers,
-		},
-		(proxyRes) => {
-			console.log(`Received response: ${proxyRes.statusCode}`);
-			res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
-			proxyRes.pipe(res);
+			}
+			// Handle other message types if needed in the future
+		} catch (err) {
+			console.error("Error processing WebSocket message:", err);
 		}
-	);
-
-	proxyReq.on("error", (err) => {
-		console.error("Proxy request error:", err);
-		res.writeHead(502, { "Content-Type": "text/plain" });
-		res.end("Bad Gateway - SSH tunnel not available");
 	});
 
-	req.pipe(proxyReq);
-});
+	ws.on("close", () => {
+		console.log("PC A client disconnected");
+		if (connectedClient === ws) {
+			connectedClient = null;
+		}
+	});
 
-httpServer.on("proxy-request", (stream) => {
-	// Store the tunnel stream for HTTP proxying
-	tunnelStream = stream;
-	console.log("Tunnel stream established");
-
-	// Handle stream close
-	stream.on("close", () => {
-		tunnelStream = null;
-		console.log("Tunnel stream closed");
+	ws.on("error", (err) => {
+		console.error("WebSocket error on server:", err);
+		if (connectedClient === ws) {
+			connectedClient = null;
+		}
 	});
 });
 
-httpServer.listen(8000, () => {
-	console.log("HTTP server listening on port 8000");
+// --- HTTP Handling ---
+
+// New endpoint for PC A Client to stream large data back
+app.post("/upload-stream/:requestId", (req: Request, res: Response) => {
+	const requestId = req.params.requestId;
+	console.log(`Received data stream for request ${requestId}`);
+
+	const pending = pendingRequests.get(requestId);
+	if (!pending) {
+		console.error(`Data stream for unknown request ID: ${requestId}`);
+		return res.status(404).send("Request ID not found");
+	}
+
+	// Pipe the incoming stream directly to the original client's response
+	// This efficiently streams data without loading it all into memory
+	req.pipe(pending.res);
+
+	req.on("end", () => {
+		console.log(`Data stream ended for request ${requestId}`);
+		pending.res.end(); // Close the original response to the public user
+		pendingRequests.delete(requestId); // Cleanup
+		res.status(200).send("OK"); // Acknowledge receipt to PC A Client
+	});
+
+	req.on("error", (err) => {
+		console.error(`Error receiving data stream for ${requestId}:`, err);
+		// Ensure the original response is ended even on error
+		if (!pending.res.writableEnded) {
+			pending.res.status(500).end("Internal Server Error during streaming");
+		}
+		pendingRequests.delete(requestId); // Cleanup
+		// Don't send response on `res` if the pipe already started, but acknowledging is good practice if possible early
+		// Here, we just log the error for the upload response
+		console.error(`Error acknowledged to PC A for ${requestId}`); // Adjust based on when error occurs
+	});
+});
+
+// Handle incoming public HTTP requests (catch-all)
+// You might want specific routes instead of app.use
+app.use((req: Request, res: Response) => {
+	if (!connectedClient || connectedClient.readyState !== WebSocket.OPEN) {
+		return res.status(503).send("PC A is not connected or ready");
+	}
+
+	const requestId = generateUniqueId();
+	pendingRequests.set(requestId, { req, res }); // Store for later use
+
+	// Package the HTTP request details
+	const requestData = {
+		method: req.method,
+		url: req.url,
+		headers: req.headers,
+		// Note: req.body handling requires middleware like express.json() etc.
+		// Streaming the original request body is more complex and might require
+		// capturing it before this handler or using a reverse proxy approach.
+		// For simplicity, assuming no body or it's handled by middleware if needed.
+	};
+
+	// Send request details to PC A via WebSocket
+	const message = JSON.stringify({ type: "http_request", requestId, data: requestData });
+	connectedClient.send(message);
+
+	console.log(`Forwarded request ${requestId} (${req.method} ${req.url}) to PC A`);
+
+	// Optional: Set a timeout to cleanup if no init/data arrives
+	const timeout = setTimeout(() => {
+		if (pendingRequests.has(requestId) && !res.headersSent) {
+			console.log(`Request ${requestId} timed out`);
+			res.status(504).send("Gateway Timeout");
+			pendingRequests.delete(requestId);
+		}
+	}, 120000); // 2 minutes timeout
+
+	// Clear timeout if response processing starts or ends
+	const clearTimer = () => clearTimeout(timeout);
+	res.on("headers", clearTimer); // Headers sent
+	res.on("finish", clearTimer); // Response finished
+	res.on("close", clearTimer); // Client disconnected
+});
+
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
+server.listen(PORT, "0.0.0.0", () => {
+	// Listen on all interfaces
+	console.log(`Relay server listening on port ${PORT}`);
 });
