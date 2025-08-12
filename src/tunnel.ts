@@ -475,8 +475,18 @@ export class TunnelBroker {
 		// Create headers object
 		const headers = new Headers(proxyResponse.headers);
 
+		// Validate status code is within valid range (200-599)
+		let status = proxyResponse.status;
+		if (status < 200 || status > 599) {
+			this.logConnectionEvent("Invalid status code received from host, defaulting to 502", {
+				originalStatus: status,
+				correctedStatus: 502,
+			});
+			status = 502; // Bad Gateway
+		}
+
 		return new Response(bodyBuffer, {
-			status: proxyResponse.status,
+			status,
 			headers,
 		});
 	}
@@ -587,7 +597,7 @@ export class TunnelBroker {
 			return false;
 		}
 
-		if (typeof response.status !== "number" || response.status < 100 || response.status > 599) {
+		if (typeof response.status !== "number" || response.status < 200 || response.status > 599) {
 			return false;
 		}
 
