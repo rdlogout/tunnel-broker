@@ -109,7 +109,7 @@ httpServer.on("request", (req, res) => {
 	const proxyReq = httpRequest(
 		{
 			host: "127.0.0.1",
-			port: 3001, // This should connect through the SSH tunnel to host:3000
+			port: 3000, // This should connect through the SSH tunnel to host:3000
 			method: req.method,
 			path: req.url,
 			headers: req.headers,
