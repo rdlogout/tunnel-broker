@@ -32,11 +32,11 @@ const server = http.createServer((req, res) => {
 	pendingResponses.set(id, res);
 
 	req.on("data", (chunk: Buffer) => {
-		sendFramedMessage(clientWs, { type: "body_chunk", id }, chunk);
+		sendFramedMessage(clientWs as any, { type: "body_chunk", id }, chunk);
 	});
 
 	req.on("end", () => {
-		sendFramedMessage(clientWs, { type: "body_end", id }, Buffer.alloc(0));
+		sendFramedMessage(clientWs as any, { type: "body_end", id }, Buffer.alloc(0));
 	});
 
 	req.on("error", (err) => {
