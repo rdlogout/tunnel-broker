@@ -16,20 +16,20 @@ const broker = new TunnelBroker();
 const wss = new WebSocketServer({ noServer: true });
 
 server.on("upgrade", (req, socket, head) => {
-  try {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      if (url.pathname === "/__connect") {
-        // Host connection
-        broker.handleHostWebSocketConnection(ws, req);
-      } else {
-        // Client connection to be proxied
-        broker.handleClientWebSocketConnection(ws, req);
-      }
-    });
-  } catch (e) {
-    socket.destroy();
-  }
+	try {
+		const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+		wss.handleUpgrade(req, socket, head, (ws) => {
+			if (url.pathname === "/__connect") {
+				// Host connection
+				broker.handleHostWebSocketConnection(ws, req);
+			} else {
+				// Client connection to be proxied
+				broker.handleClientWebSocketConnection(ws, req);
+			}
+		});
+	} catch (e) {
+		socket.destroy();
+	}
 });
 
 // Routes matching working.ts control APIs
@@ -40,8 +40,14 @@ app.get("/__request", (req, res) => broker.handleRequest(req, res));
 app.use((req, res) => broker.handleHttpProxy(req, res));
 
 server.listen(PORT, () => {
-  console.log(`Tunnel Broker (Express) listening on port ${PORT}`);
+	console.log(`Tunnel Broker (Express) listening on port ${PORT}`);
 });
 
-process.on("SIGINT", () => { broker.cleanup(); process.exit(0); });
-process.on("SIGTERM", () => { broker.cleanup(); process.exit(0); });
+process.on("SIGINT", () => {
+	broker.cleanup();
+	process.exit(0);
+});
+process.on("SIGTERM", () => {
+	broker.cleanup();
+	process.exit(0);
+});
