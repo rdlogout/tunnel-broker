@@ -47,7 +47,7 @@ interface Attachment {
 export class TunnelBroker {
 	private hostConnection: WebSocket | null = null;
 	private readonly RESPONSE_TIMEOUT = 45 * 1000; // keep parity with working.ts
-	private readonly MAX_BODY_SIZE = 10 * 1024; // 512KB
+	private readonly MAX_BODY_SIZE = 100 * 1024; // 512KB
 	private pendingRequests = new Map<string, StoredRequest>();
 	private clientSockets: Map<string, WebSocket> = new Map();
 	private readonly MAX_CONCURRENT_CLIENTS = 500;
